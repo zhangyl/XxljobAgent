@@ -11,10 +11,13 @@ import java.util.concurrent.Callable;
  * <p>
  * 逻辑：
  * <ol>
+ *   <li><b>remove 方法：</b>在调用原始方法<b>之前</b>，先通过参数 id
+ *       调用 {@code XxlJobInfoMapper#loadById(int)} 查询任务详情并暂存，
+ *       避免物理删除后无法查询</li>
  *   <li>调用原始方法，拿到返回值 {@code Response<String>}</li>
  *   <li>从参数中提取 {@code LoginInfo#getUserName()}</li>
- *   <li>从返回值或参数中提取任务 id</li>
- *   <li>通过 {@code XxlJobInfoMapper#loadById(int)} 查询任务详情</li>
+ *   <li>从返回值或参数中提取任务 id（remove 使用前置提取的 id）</li>
+ *   <li>通过 {@code XxlJobInfoMapper#loadById(int)} 查询任务详情（remove 使用前置查询的结果）</li>
  *   <li>将操作人和任务信息 POST 到 {@code http://groot.hz.com/save}</li>
  * </ol>
  * </p>
@@ -35,14 +38,28 @@ public class JobServiceInterceptor {
             @Origin Method method,
             @AllArguments Object[] args
     ) throws Exception {
+        String methodName = method.getName();
+        System.out.println("[myagent] Intercepted method: " + methodName);
+
+        // ---- remove 方法：前置获取任务信息，避免物理删除后无法查询 ----
+        Object preloadedJobInfo = null;
+        String preloadedJobIdStr = null;
+        if ("remove".equals(methodName)) {
+            try {
+                preloadedJobIdStr = extractJobId(methodName, args, null);
+                if (preloadedJobIdStr != null) {
+                    preloadedJobInfo = loadJobInfo(target, Integer.parseInt(preloadedJobIdStr));
+                }
+            } catch (Exception e) {
+                System.err.println("[myagent] Pre-load job info for remove failed: " + e.getMessage());
+            }
+        }
+
         // 1. 调用原始方法
         Object result = zuper.call();
 
         // 2. 后置处理 —— 所有异常捕获，不影响原始业务流程
         try {
-            String methodName = method.getName();
-            System.out.println("[myagent] Intercepted method: " + methodName);
-
             // 提取操作人
             String operator = extractOperator(methodName, args);
             if (operator == null) {
@@ -50,16 +67,26 @@ public class JobServiceInterceptor {
                 return result;
             }
 
-            // 提取任务 id
-            String jobIdStr = extractJobId(methodName, args, result);
+            // 提取任务 id 和任务详情（remove 使用前置获取的数据）
+            final String jobIdStr;
+            final Object jobInfo;
+
+            if ("remove".equals(methodName)) {
+                jobIdStr = preloadedJobIdStr;
+                jobInfo = preloadedJobInfo;
+            } else {
+                jobIdStr = extractJobId(methodName, args, result);
+                if (jobIdStr == null) {
+                    System.out.println("[myagent] Unable to extract jobId, skipped.");
+                    return result;
+                }
+                jobInfo = loadJobInfo(target, Integer.parseInt(jobIdStr));
+            }
+
             if (jobIdStr == null) {
                 System.out.println("[myagent] Unable to extract jobId, skipped.");
                 return result;
             }
-            int jobId = Integer.parseInt(jobIdStr);
-
-            // 通过 mapper 查询任务详情
-            Object jobInfo = loadJobInfo(target, jobId);
 
             // 推送到远端接口
             HttpReporter.report(operator, jobInfo, methodName, jobIdStr);
