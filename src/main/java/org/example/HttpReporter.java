@@ -92,7 +92,7 @@ public class HttpReporter {
             } else {
                 // 生产模式：真实 HTTP 请求
                 System.out.println("[myagent] Reporting to " + REPORT_URL + " : " + json);
-                //TODO 临时注释本地测试
+                //TODO zyl 测试暂时注释
 //                doPost(json);
             }
 

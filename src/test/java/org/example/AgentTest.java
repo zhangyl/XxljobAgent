@@ -1,5 +1,7 @@
 package org.example;
 
+import com.xxl.job.admin.business.controller.JobGroupController;
+import com.xxl.job.admin.business.model.XxlJobGroup;
 import com.xxl.job.admin.business.model.XxlJobInfo;
 import com.xxl.job.admin.business.service.impl.XxlJobServiceImpl;
 import com.xxl.sso.core.model.LoginInfo;
@@ -11,6 +13,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import java.util.Arrays;
 import java.util.List;
 
 import static net.bytebuddy.matcher.ElementMatchers.named;
@@ -36,6 +39,7 @@ public class AgentTest {
     @After
     public void tearDown() {
         HttpReporter.setTestHook(null);
+        JobGroupInterceptor.clearTestOperator();
     }
 
     // ================================================================
@@ -221,5 +225,126 @@ public class AgentTest {
         assertTrue(payload.contains("\"action\":\"trigger\""));
 
         System.out.println("[test] ✅ trigger parameter order test passed");
+    }
+
+    // ================================================================
+    // JobGroupController 测试
+    // ================================================================
+
+    /**
+     * 创建一个已织入拦截器的 JobGroupController 实例。
+     */
+    private static JobGroupController createInstrumentedGroupController() throws Exception {
+        Class<? extends JobGroupController> instrumentedClass = new ByteBuddy()
+                .subclass(JobGroupController.class)
+                .method(named("insert")
+                        .or(named("update"))
+                        .or(named("delete")))
+                .intercept(MethodDelegation.to(JobGroupInterceptor.class))
+                .make()
+                .load(JobGroupController.class.getClassLoader(),
+                        ClassLoadingStrategy.Default.INJECTION)
+                .getLoaded();
+
+        return instrumentedClass.newInstance();
+    }
+
+    /**
+     * 核心测试：验证 JobGroupController 三个方法的拦截 + 上报。
+     */
+    @Test
+    public void testJobGroupInsertUpdateDelete() throws Exception {
+        JobGroupController controller = createInstrumentedGroupController();
+        JobGroupInterceptor.setTestOperator("groupAdmin");
+
+        // ---- insert ----
+        XxlJobGroup newGroup = new XxlJobGroup(0, "test-app-insert", "新执行器");
+        Response<String> insertResp = controller.insert(newGroup);
+        assertNotNull(insertResp);
+        assertEquals("3001", insertResp.getData());
+
+        // ---- update ----
+        XxlJobGroup updateGroup = new XxlJobGroup(4001, "test-app-update", "更新执行器");
+        Response<String> updateResp = controller.update(updateGroup);
+        assertNotNull(updateResp);
+        assertEquals("4001", updateResp.getData());
+
+        // ---- delete ----
+        Response<String> deleteResp = controller.delete(Arrays.asList(5001, 5002));
+        assertNotNull(deleteResp);
+
+        // ---- 验证上报数据 ----
+        System.out.println("[test] Total captured group payloads: " + captured.size());
+        for (int i = 0; i < captured.size(); i++) {
+            System.out.println("[test]   [" + i + "] " + captured.get(i));
+        }
+        assertEquals("Should have 4 reports (1 insert + 1 update + 2 delete)",
+                4, captured.size());
+
+        // 验证 insert 上报
+        String insertPayload = captured.get(0);
+        assertTrue("insert should contain operator", insertPayload.contains("\"operator\":\"groupAdmin\""));
+        assertTrue("insert should contain action insertGroup", insertPayload.contains("\"action\":\"insertGroup\""));
+        assertTrue("insert should contain jobInfo", insertPayload.contains("\"jobInfo\""));
+        assertTrue("insert should have jobInfo with appname",
+                insertPayload.contains("test-app-insert"));
+
+        // 验证 update 上报
+        String updatePayload = captured.get(1);
+        assertTrue("update should contain action updateGroup", updatePayload.contains("\"action\":\"updateGroup\""));
+        assertTrue("update should contain jobId 4001", updatePayload.contains("\"jobId\":\"4001\""));
+        assertTrue("update should have jobInfo with id 4001",
+                updatePayload.contains("test-app-4001"));
+
+        // 验证 delete 上报（5001）
+        String deletePayload1 = captured.get(2);
+        assertTrue("delete should contain action deleteGroup", deletePayload1.contains("\"action\":\"deleteGroup\""));
+        assertTrue("delete should contain jobId 5001", deletePayload1.contains("\"jobId\":\"5001\""));
+        assertTrue("delete should have jobInfo with id 5001",
+                deletePayload1.contains("test-app-5001"));
+
+        // 验证 delete 上报（5002）
+        String deletePayload2 = captured.get(3);
+        assertTrue("delete should contain jobId 5002", deletePayload2.contains("\"jobId\":\"5002\""));
+        assertTrue("delete should have jobInfo with id 5002",
+                deletePayload2.contains("test-app-5002"));
+
+        System.out.println("[test] ✅ JobGroup insert/update/delete all verified!");
+    }
+
+    /**
+     * 测试没有操作人时的优雅降级：不抛异常，不上报，原始方法正常返回。
+     */
+    @Test
+    public void testJobGroupWithoutOperator() throws Exception {
+        JobGroupController controller = createInstrumentedGroupController();
+        // 不设置 testOperator，且环境中无 Spring → extractOperator 返回 null
+
+        XxlJobGroup group = new XxlJobGroup(0, "noop-group", "无操作人");
+        Response<String> resp = controller.insert(group);
+        assertNotNull(resp);
+        assertEquals("3001", resp.getData());
+
+        assertTrue("No payload should be captured when operator is null", captured.isEmpty());
+
+        System.out.println("[test] ✅ JobGroup without operator test passed (no exception, no report)");
+    }
+
+    /**
+     * 测试 delete 没有参数时的边界情况。
+     */
+    @Test
+    public void testJobGroupDeleteWithEmptyArgs() throws Exception {
+        JobGroupController controller = createInstrumentedGroupController();
+        JobGroupInterceptor.setTestOperator("groupAdmin");
+
+        // delete 传 null —— 模拟异常场景，验证不崩溃
+        Response<String> resp = controller.delete(null);
+        assertNotNull(resp);
+
+        // preloadedIds 为 null → handleDelete 跳过上报
+        assertTrue("No payload when delete args are invalid", captured.isEmpty());
+
+        System.out.println("[test] ✅ JobGroup delete with null args test passed");
     }
 }
